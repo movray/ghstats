@@ -36,9 +36,16 @@ filesystem.
 | `TOKEN_DIR` | directory with one token file per repository owner, file `default` as fallback (default `/var/run/ghstats/tokens`) |
 
 Use a fine-grained personal access token per owner with access to the
-repositories and **Administration: Read-only** (needed for traffic). For
-repositories you have no push access to, the traffic calls return 403 and are
-skipped; stars, forks and release downloads are still collected.
+repositories and **Administration: Read-only** (needed for traffic).
+
+- Repositories whose owner has its own token file must deliver traffic. A 403
+  there makes the run exit with 1 and names the missing permission (from
+  GitHub's `X-Accepted-GitHub-Permissions` header); the other data of that
+  repository is still stored.
+- Repositories only covered by the `default` token (other people's) get stars,
+  forks and release downloads; their traffic is skipped.
+- Any other error rolls back that repository and also makes the run exit with 1,
+  so a failing Kubernetes Job shows it.
 
 Each run makes about six API requests per repository, far below the rate limit
 of 5,000 requests per hour.

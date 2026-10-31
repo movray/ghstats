@@ -6,8 +6,10 @@ and release download counts are a running total. This script runs hourly and
 stores snapshots so the history survives.
 
 Tokens: one file per repo owner in TOKEN_DIR (fine-grained PAT, Administration:
-read for traffic), file "default" as fallback. Repos without push access (other
-people's) get only the public data; their traffic calls return 403 and are skipped.
+read for traffic), file "default" as fallback. Repos of an owner with their own
+token file are expected to deliver traffic: a 403 there fails the run and names
+the missing permission. Repos only covered by "default" (other people's) get the
+public data; their traffic is skipped.
 Env: REPOS (comma-separated owner/name), DATABASE_URL (CNPG app secret "uri"),
      TOKEN_DIR (default /var/run/ghstats/tokens).
 """
@@ -47,18 +49,21 @@ CREATE TABLE IF NOT EXISTS popular_paths (
 
 
 class Forbidden(RuntimeError):
-    pass
+    def __init__(self, path, needs):
+        self.needs = needs
+        super().__init__(f"GET {path}: 403" + (f", token needs {needs}" if needs else ""))
 
 
 def token_for(repo):
+    """Return (token, own): own is True if the owner has its own token file."""
     d = os.environ.get("TOKEN_DIR", "/var/run/ghstats/tokens")
     for name in (repo.split("/")[0], "default"):
         try:
             with open(os.path.join(d, name)) as f:
-                return f.read().strip()
+                return f.read().strip(), name != "default"
         except FileNotFoundError:
             pass
-    raise RuntimeError(f"{repo}: no token in {d} for owner or default")
+    raise RuntimeError(f"no token in {d} for owner or default")
 
 
 def gh(path, token):
@@ -73,7 +78,7 @@ def gh(path, token):
             return json.load(resp)
     except urllib.error.HTTPError as e:
         if e.code == 403:
-            raise Forbidden(f"GET {path}: 403") from e
+            raise Forbidden(path, e.headers.get("X-Accepted-GitHub-Permissions")) from e
         raise RuntimeError(f"GET {path}: {e.code} {e.read()[:200]!r}") from e
 
 
@@ -88,8 +93,9 @@ def releases(repo, token):
 
 
 def collect(cur, repo, now):
+    """Store one snapshot of repo; return an error message or None."""
     today = now.date()
-    token = token_for(repo)
+    token, own = token_for(repo)
 
     r = gh(f"/repos/{repo}", token)
     cur.execute(
@@ -106,12 +112,15 @@ def collect(cur, repo, now):
                  a["download_count"]))
             n += 1
 
-    try:
-        traffic(cur, repo, token, today)
-    except Forbidden:
-        print(f"{repo}: no push access, traffic skipped", file=sys.stderr)
-
     print(f"{repo}: stars={r['stargazers_count']} assets={n}", file=sys.stderr)
+    try:
+        with cur.connection.transaction():
+            traffic(cur, repo, token, today)
+    except Forbidden as e:
+        if own:
+            return f"traffic skipped: {e}"
+        print(f"{repo}: no push access (default token), traffic skipped", file=sys.stderr)
+    return None
 
 
 def traffic(cur, repo, token, today):
@@ -138,11 +147,23 @@ def traffic(cur, repo, token, today):
 def main():
     repos = [r.strip() for r in os.environ["REPOS"].split(",") if r.strip()]
     now = datetime.now(timezone.utc).replace(microsecond=0)
+    failed = 0
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         conn.execute(SCHEMA)
+        conn.commit()
         for repo in repos:
-            with conn.transaction(), conn.cursor() as cur:
-                collect(cur, repo, now)
+            # A missing traffic permission keeps the other data of the repo;
+            # any other error rolls the repo back. Both fail the run.
+            try:
+                with conn.transaction(), conn.cursor() as cur:
+                    err = collect(cur, repo, now)
+            except Exception as e:
+                err = str(e)
+            if err:
+                print(f"{repo}: ERROR {err}", file=sys.stderr)
+                failed += 1
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
